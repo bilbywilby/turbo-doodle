@@ -1,3 +1,1081 @@
+## Phase 2 Acknowledged → Phase 3: UI + Workspace Management + Audit
+
+One note: `scripts/generate_config.py` (Draft 2020-12 schema validation, SHA-256 manifest) wasn't in the original blueprint. It's a clean addition — deterministic config exports with sorted keys is a good practice for reproducible builds. No conflicts with the existing architecture.
+
+Here's Phase 3.
+
+---
+
+## 1. Workspace Management Endpoints
+
+```typescript
+// src/api/handlers/workspaces.ts
+// //HIGH-RISK: Workspace membership controls access boundaries.
+import { Router, Request, Response, NextFunction } from 'express';
+import { z } from 'zod';
+import crypto from 'node:crypto';
+import { db } from '../../data/db';
+import { redis } from '../../data/redis';
+import { config } from '../../pkg/config';
+import { logger } from '../../pkg/logger';
+import { BadRequestError, ForbiddenError, NotFoundError, ConflictError } from '../../pkg/errors';
+
+const router = Router();
+
+// ─── Schemas ───
+
+const createWorkspaceSchema = z.object({
+  name: z.string().min(1).max(255),
+  slug: z.string().min(2).max(100).regex(/^[a-z0-9-]+$/),
+});
+
+const inviteMemberSchema = z.object({
+  email: z.string().email(),
+  role: z.enum(['admin', 'member', 'viewer']).default('member'),
+});
+
+// ─── GET /api/workspaces (list user's workspaces) ───
+
+router.get('/', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { userId } = req.context!;
+
+    const workspaces = await db('workspace_members as m')
+      .join('workspaces as w', 'm.workspace_id', 'w.id')
+      .where('m.user_id', userId)
+      .select('w.id', 'w.name', 'w.slug', 'm.role', 'm.created_at as joined_at');
+
+    res.json({ workspaces });
+  } catch (err) { next(err); }
+});
+
+// ─── POST /api/workspaces (create new workspace) ───
+
+router.post('/', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { userId } = req.context!;
+    const data = createWorkspaceSchema.parse(req.body);
+
+    // Check slug uniqueness
+    const existing = await db('workspaces').where({ slug: data.slug }).first();
+    if (existing) throw new ConflictError('Workspace slug already taken');
+
+    const workspaceId = crypto.randomUUID();
+
+    await db.transaction(async (trx) => {
+      await trx('workspaces').insert({
+        id: workspaceId,
+        name: data.name,
+        slug: data.slug,
+      });
+      await trx('workspace_members').insert({
+        id: crypto.randomUUID(),
+        workspace_id: workspaceId,
+        user_id: userId,
+        role: 'owner',
+      });
+    });
+
+    // Issue a new access token scoped to this workspace
+    const jwt = (await import('jsonwebtoken')).default;
+    const accessToken = jwt.sign(
+      { sub: userId, workspace_id: workspaceId, role: 'owner' },
+      config.jwt.secret,
+      { expiresIn: config.jwt.expiry, issuer: 'xlean' },
+    );
+    const refreshToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+    const ttl = config.refreshTokenTtlDays * 86400;
+    await redis.set(`session:${userId}:${workspaceId}`,
+      JSON.stringify({ token_hash: tokenHash, created_at: Date.now() }), 'EX', ttl);
+    await redis.set(`refresh_lookup:${tokenHash}`,
+      JSON.stringify({ user_id: userId, workspace_id: workspaceId }), 'EX', ttl);
+
+    res.status(201).json({
+      workspace: { id: workspaceId, name: data.name, slug: data.slug },
+      access_token: accessToken,
+      refresh_token: refreshToken,
+    });
+  } catch (err) {
+    if (err instanceof z.ZodError) next(new BadRequestError('Validation failed', { errors: err.flatten() }));
+    else next(err);
+  }
+});
+
+// ─── GET /api/workspaces/:workspaceId/members ───
+
+router.get('/:workspaceId/members', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { workspaceId } = req.params;
+    if (workspaceId !== req.context!.workspaceId) throw new ForbiddenError('Workspace mismatch');
+
+    const members = await db('workspace_members as m')
+      .join('users as u', 'm.user_id', 'u.id')
+      .where('m.workspace_id', workspaceId)
+      .select('u.id', 'u.email', 'u.display_name', 'm.role', 'm.created_at');
+
+    res.json({ members });
+  } catch (err) { next(err); }
+});
+
+// ─── POST /api/workspaces/:workspaceId/members (invite) ───
+
+router.post('/:workspaceId/members', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { workspaceId } = req.params;
+    if (workspaceId !== req.context!.workspaceId) throw new ForbiddenError('Workspace mismatch');
+
+    // Only owner or admin can invite
+    if (!['owner', 'admin'].includes(req.context!.role)) {
+      throw new ForbiddenError('Only owners and admins can invite members');
+    }
+
+    const { email, role } = inviteMemberSchema.parse(req.body);
+
+    // Find user by email
+    const user = await db('users').where({ email }).first();
+    if (!user) throw new NotFoundError('User');
+
+    // Check if already a member
+    const existing = await db('workspace_members')
+      .where({ workspace_id: workspaceId, user_id: user.id }).first();
+    if (existing) throw new ConflictError('User is already a member');
+
+    await db('workspace_members').insert({
+      id: crypto.randomUUID(),
+      workspace_id: workspaceId,
+      user_id: user.id,
+      role,
+    });
+
+    // Audit
+    await db.transaction(async (trx) => {
+      await trx.raw('SELECT set_config(\'app.workspace_id\', ?, true)', [workspaceId]);
+      await trx('audit_logs').insert({
+        id: crypto.randomUUID(),
+        workspace_id: workspaceId,
+        actor_id: req.context!.userId,
+        action: 'member.invite',
+        resource_type: 'workspace_member',
+        resource_id: user.id,
+        metadata: { email, role },
+      });
+    });
+
+    logger.info({ workspaceId, invited: email, role, by: req.context!.userId }, 'Member invited');
+    res.status(201).json({ member: { user_id: user.id, email, role } });
+  } catch (err) {
+    if (err instanceof z.ZodError) next(new BadRequestError('Validation failed', { errors: err.flatten() }));
+    else next(err);
+  }
+});
+
+// ─── PATCH /api/workspaces/:workspaceId/members/:userId (change role) ───
+
+router.patch('/:workspaceId/members/:userId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { workspaceId, userId } = req.params;
+    if (workspaceId !== req.context!.workspaceId) throw new ForbiddenError('Workspace mismatch');
+    if (!['owner', 'admin'].includes(req.context!.role)) throw new ForbiddenError();
+
+    const schema = z.object({ role: z.enum(['admin', 'member', 'viewer']) });
+    const { role } = schema.parse(req.body);
+
+    // Can't demote the last owner
+    if (role !== 'owner') {
+      const owners = await db('workspace_members')
+        .where({ workspace_id: workspaceId, role: 'owner' });
+      if (owners.length === 1 && owners[0].user_id === userId) {
+        throw new ConflictError('Cannot demote the last owner');
+      }
+    }
+
+    await db('workspace_members')
+      .where({ workspace_id: workspaceId, user_id: userId })
+      .update({ role });
+
+    res.json({ member: { user_id: userId, role } });
+  } catch (err) {
+    if (err instanceof z.ZodError) next(new BadRequestError('Validation failed', { errors: err.flatten() }));
+    else next(err);
+  }
+});
+
+// ─── DELETE /api/workspaces/:workspaceId/members/:userId (remove) ───
+
+router.delete('/:workspaceId/members/:userId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { workspaceId, userId } = req.params;
+    if (workspaceId !== req.context!.workspaceId) throw new ForbiddenError('Workspace mismatch');
+    if (!['owner', 'admin'].includes(req.context!.role)) throw new ForbiddenError();
+
+    const member = await db('workspace_members')
+      .where({ workspace_id: workspaceId, user_id: userId }).first();
+    if (!member) throw new NotFoundError('Member');
+
+    // Can't remove the last owner
+    if (member.role === 'owner') {
+      const owners = await db('workspace_members')
+        .where({ workspace_id: workspaceId, role: 'owner' });
+      if (owners.length === 1) throw new ConflictError('Cannot remove the last owner');
+    }
+
+    await db('workspace_members')
+      .where({ workspace_id: workspaceId, user_id: userId })
+      .del();
+
+    // Revoke their session for this workspace
+    await redis.del(`session:${userId}:${workspaceId}`);
+
+    res.status(204).send();
+  } catch (err) { next(err); }
+});
+
+// ─── DELETE /api/workspaces/:workspaceId (delete workspace) ───
+
+router.delete('/:workspaceId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { workspaceId } = req.params;
+    if (workspaceId !== req.context!.workspaceId) throw new ForbiddenError('Workspace mismatch');
+    if (req.context!.role !== 'owner') throw new ForbiddenError('Only the owner can delete a workspace');
+
+    // CASCADE deletes handle members, articles, audit_logs
+    await db('workspaces').where({ id: workspaceId }).del();
+
+    // Revoke all sessions for this workspace
+    const members = await db('workspace_members').where({ workspace_id: workspaceId });
+    for (const m of members) {
+      await redis.del(`session:${m.user_id}:${workspaceId}`);
+    }
+
+    logger.warn({ workspaceId, by: req.context!.userId }, 'Workspace deleted');
+    res.status(204).send();
+  } catch (err) { next(err); }
+});
+
+export default router;
+```
+
+### Updated `src/api/routes.ts`
+
+```typescript
+// src/api/routes.ts
+import { Router } from 'express';
+import { authenticate } from './middleware/auth';
+import { tenantContext } from './middleware/tenant-context';
+import { rateLimit } from './middleware/rate-limit';
+import healthRouter from './handlers/health';
+import authRouter from './handlers/auth';
+import articlesRouter from './handlers/articles';
+import workspacesRouter from './handlers/workspaces';
+
+const router = Router();
+
+// Public
+router.use('/health', healthRouter);
+router.use('/auth', rateLimit('auth'), authRouter);
+
+// Protected (auth only — for workspace management, user's own context)
+router.use('/workspaces',
+  authenticate,
+  rateLimit('workspaces'),
+  workspacesRouter,
+);
+
+// Protected (auth + tenant context — for tenant-scoped CRUD)
+router.use('/workspaces/:workspaceId/articles',
+  authenticate,
+  tenantContext,
+  rateLimit('articles'),
+  articlesRouter,
+);
+
+export default router;
+```
+
+> **Route conflict note:** `/workspaces` (list/create) and `/workspaces/:workspaceId/articles` are separate routes. Express matches in order — the articles route is more specific and mounted second, so it wins for `/workspaces/:id/articles` paths. The workspaces router handles everything else under `/workspaces`.
+
+---
+
+## 2. React SPA
+
+### `src/client/main.tsx`
+
+```tsx
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+import './index.css';
+
+createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+);
+```
+
+### `src/client/index.css`
+
+```css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+```
+
+### `tailwind.config.ts`
+
+```typescript
+import type { Config } from 'tailwindcss';
+
+export default {
+  content: ['./src/client/**/*.{ts,tsx}'],
+  theme: {
+    extend: {
+      colors: {
+        surface: {
+          DEFAULT: '#0f172a',
+          card: '#1e293b',
+          border: '#334155',
+        },
+        accent: {
+          DEFAULT: '#38bdf8',
+          hover: '#7dd3fc',
+        },
+      },
+    },
+  },
+  plugins: [],
+} satisfies Config;
+```
+
+### `src/client/App.tsx`
+
+```tsx
+import { useState, useCallback } from 'react';
+import { api } from './lib/api-client';
+import { LoginPage } from './pages/LoginPage';
+import { DashboardPage } from './pages/DashboardPage';
+
+interface Session {
+  accessToken: string;
+  refreshToken: string;
+  workspaceId: string;
+  workspaceSlug: string;
+}
+
+export default function App() {
+  const [session, setSession] = useState<Session | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  // Restore session from localStorage on mount
+  useState(() => {
+    const saved = localStorage.getItem('xlean_session');
+    if (saved) {
+      const s = JSON.parse(saved) as Session;
+      api.setTokens(s.accessToken, s.refreshToken);
+      setSession(s);
+    }
+    setLoading(false);
+  });
+
+  const handleLogin = useCallback((s: Session) => {
+    api.setTokens(s.accessToken, s.refreshToken);
+    setSession(s);
+    localStorage.setItem('xlean_session', JSON.stringify(s));
+  }, []);
+
+  const handleLogout = useCallback(async () => {
+    await api.logout();
+    setSession(null);
+    localStorage.removeItem('xlean_session');
+  }, []);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-surface">
+        <div className="text-accent animate-pulse">Loading…</div>
+      </div>
+    );
+  }
+
+  if (!session) {
+    return <LoginPage onLogin={handleLogin} />;
+  }
+
+  return (
+    <DashboardPage
+      session={session}
+      onLogout={handleLogout}
+    />
+  );
+}
+```
+
+### `src/client/pages/LoginPage.tsx`
+
+```tsx
+import { useState } from 'react';
+import { api } from '../lib/api-client';
+
+interface Props {
+  onLogin: (s: { accessToken: string; refreshToken: string; workspaceId: string; workspaceSlug: string }) => void;
+}
+
+export function LoginPage({ onLogin }: Props) {
+  const [mode, setMode] = useState<'login' | 'register'>('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [wsName, setWsName] = useState('');
+  const [wsSlug, setWsSlug] = useState('');
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setSubmitting(true);
+    try {
+      const result = mode === 'login'
+        ? await api.login(email, password)
+        : await api.register(email, password, displayName, wsName, wsSlug);
+
+      onLogin({
+        accessToken: result.access_token,
+        refreshToken: result.refresh_token,
+        workspaceId: result.workspace.id,
+        workspaceSlug: result.workspace.slug,
+      });
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-surface">
+      <div className="w-full max-w-md bg-surface-card rounded-lg border border-surface-border p-8">
+        <h1 className="text-2xl font-bold text-white mb-6">
+          {mode === 'login' ? 'Sign in' : 'Create workspace'}
+        </h1>
+
+        {error && (
+          <div className="mb-4 p-3 bg-red-900/30 border border-red-700 rounded text-red-300 text-sm">
+            {error}
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm text-slate-400 mb-1">Email</label>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              required
+              className="w-full px-3 py-2 bg-surface border border-surface-border rounded text-white focus:outline-none focus:border-accent"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm text-slate-400 mb-1">Password</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+              minLength={8}
+              className="w-full px-3 py-2 bg-surface border border-surface-border rounded text-white focus:outline-none focus:border-accent"
+            />
+          </div>
+
+          {mode === 'register' && (
+            <>
+              <div>
+                <label className="block text-sm text-slate-400 mb-1">Display name</label>
+                <input
+                  value={displayName}
+                  onChange={(e) => setDisplayName(e.target.value)}
+                  required
+                  className="w-full px-3 py-2 bg-surface border border-surface-border rounded text-white focus:outline-none focus:border-accent"
+                />
+              </div>
+              <div>
+                <label className="block text-sm text-slate-400 mb-1">Workspace name</label>
+                <input
+                  value={wsName}
+                  onChange={(e) => setWsName(e.target.value)}
+                  required
+                  className="w-full px-3 py-2 bg-surface border border-surface-border rounded text-white focus:outline-none focus:border-accent"
+                />
+              </div>
+              <div>
+                <label className="block text-sm text-slate-400 mb-1">Workspace slug</label>
+                <input
+                  value={wsSlug}
+                  onChange={(e) => setWsSlug(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '-'))}
+                  required
+                  pattern="^[a-z0-9-]+$"
+                  className="w-full px-3 py-2 bg-surface border border-surface-border rounded text-white focus:outline-none focus:border-accent"
+                />
+              </div>
+            </>
+          )}
+
+          <button
+            type="submit"
+            disabled={submitting}
+            className="w-full py-2 bg-accent hover:bg-accent-hover text-surface font-semibold rounded transition disabled:opacity-50"
+          >
+            {submitting ? '…' : mode === 'login' ? 'Sign in' : 'Create'}
+          </button>
+        </form>
+
+        <p className="mt-4 text-sm text-slate-500 text-center">
+          {mode === 'login' ? (
+            <>No account?{' '}
+              <button onClick={() => setMode('register')} className="text-accent hover:underline">
+                Create a workspace
+              </button>
+            </>
+          ) : (
+            <>Already have an account?{' '}
+              <button onClick={() => setMode('login')} className="text-accent hover:underline">
+                Sign in
+              </button>
+            </>
+          )}
+        </p>
+      </div>
+    </div>
+  );
+}
+```
+
+### `src/client/pages/DashboardPage.tsx`
+
+```tsx
+import { useState, useEffect, useCallback } from 'react';
+import { api } from '../lib/api-client';
+
+interface Session {
+  accessToken: string;
+  refreshToken: string;
+  workspaceId: string;
+  workspaceSlug: string;
+}
+
+interface Article {
+  id: string;
+  title: string;
+  content: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface Props {
+  session: Session;
+  onLogout: () => void;
+}
+
+export function DashboardPage({ session, onLogout }: Props) {
+  const [articles, setArticles] = useState<Article[]>([]);
+  const [editing, setEditing] = useState<Article | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [title, setTitle] = useState('');
+  const [content, setContent] = useState('');
+  const [status, setStatus] = useState<'draft' | 'published'>('draft');
+  const [error, setError] = useState('');
+
+  const wsId = session.workspaceId;
+
+  const fetchArticles = useCallback(async () => {
+    try {
+      const { articles } = await api.getArticles(wsId);
+      setArticles(articles as Article[]);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }, [wsId]);
+
+  useEffect(() => { fetchArticles(); }, [fetchArticles]);
+
+  const handleSave = async () => {
+    setError('');
+    try {
+      if (editing) {
+        await api.updateArticle(wsId, editing.id, { title, content, status });
+      } else {
+        await api.createArticle(wsId, { title, content, status });
+      }
+      setEditing(null);
+      setCreating(false);
+      setTitle('');
+      setContent('');
+      setStatus('draft');
+      fetchArticles();
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    if (!confirm('Delete this article?')) return;
+    await api.deleteArticle(wsId, id);
+    fetchArticles();
+  };
+
+  return (
+    <div className="min-h-screen bg-surface">
+      {/* Header */}
+      <header className="border-b border-surface-border px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center gap-4">
+          <span className="text-white font-bold text-lg">XLean</span>
+          <span className="text-slate-500">/</span>
+          <span className="text-accent">{session.workspaceSlug}</span>
+        </div>
+        <button onClick={onLogout} className="text-sm text-slate-400 hover:text-white">
+          Sign out
+        </button>
+      </header>
+
+      <main className="max-w-4xl mx-auto p-6">
+        {error && (
+          <div className="mb-4 p-3 bg-red-900/30 border border-red-700 rounded text-red-300 text-sm">
+            {error}
+            <button onClick={() => setError('')} className="ml-2 text-red-500">✕</button>
+          </div>
+        )}
+
+        {/* Editor */}
+        {(creating || editing) && (
+          <div className="mb-6 bg-surface-card border border-surface-border rounded-lg p-6">
+            <h2 className="text-lg font-semibold text-white mb-4">
+              {editing ? 'Edit article' : 'New article'}
+            </h2>
+            <div className="space-y-4">
+              <input
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="Title"
+                className="w-full px-3 py-2 bg-surface border border-surface-border rounded text-white focus:outline-none focus:border-accent"
+              />
+              <textarea
+                value={content}
+                onChange={(e) => setContent(e.target.value)}
+                placeholder="Content…"
+                rows={8}
+                className="w-full px-3 py-2 bg-surface border border-surface-border rounded text-white focus:outline-none focus:border-accent resize-y"
+              />
+              <div className="flex items-center gap-4">
+                <select
+                  value={status}
+                  onChange={(e) => setStatus(e.target.value as 'draft' | 'published')}
+                  className="px-3 py-2 bg-surface border border-surface-border rounded text-white"
+                >
+                  <option value="draft">Draft</option>
+                  <option value="published">Published</option>
+                </select>
+                <button
+                  onClick={handleSave}
+                  className="px-4 py-2 bg-accent text-surface font-medium rounded hover:bg-accent-hover"
+                >
+                  Save
+                </button>
+                <button
+                  onClick={() => { setCreating(false); setEditing(null); }}
+                  className="px-4 py-2 text-slate-400 hover:text-white"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Article list */}
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-semibold text-white">
+            Articles <span className="text-slate-500">({articles.length})</span>
+          </h2>
+          <button
+            onClick={() => { setCreating(true); setEditing(null); }}
+            className="px-4 py-2 bg-accent text-surface font-medium rounded hover:bg-accent-hover"
+          >
+            + New article
+          </button>
+        </div>
+
+        {articles.length === 0 ? (
+          <div className="text-slate-500 text-center py-12">
+            No articles yet. Create your first one.
+          </div>
+        ) : (
+          <ul className="space-y-2">
+            {articles.map((a) => (
+              <li
+                key={a.id}
+                className="flex items-center justify-between bg-surface-card border border-surface-border rounded-lg px-4 py-3"
+              >
+                <div className="flex-1 min-w-0">
+                  <span className="text-white font-medium truncate">{a.title}</span>
+                  <span className={`ml-3 text-xs px-2 py-0.5 rounded ${
+                    a.status === 'published' ? 'bg-green-900/40 text-green-400' : 'bg-yellow-900/40 text-yellow-400'
+                  }`}>
+                    {a.status}
+                  </span>
+                </div>
+                <div className="flex gap-2 ml-4">
+                  <button
+                    onClick={() => { setEditing(a); setCreating(false); setTitle(a.title); setContent(a.content); setStatus(a.status as 'draft' | 'published'); }}
+                    className="text-sm text-accent hover:underline"
+                  >
+                    Edit
+                  </button>
+                  <button
+                    onClick={() => handleDelete(a.id)}
+                    className="text-sm text-red-400 hover:underline"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </main>
+    </div>
+  );
+}
+```
+
+### Updated `src/client/lib/api-client.ts` (Add workspace methods)
+
+```typescript
+// Add to the existing ApiClient class:
+
+  // ─── Workspaces ───
+  register(email: string, password: string, displayName: string, wsName: string, wsSlug: string) {
+    return this.request<{
+      access_token: string;
+      refresh_token: string;
+      workspace: { id: string; slug: string };
+    }>('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({ email, password, display_name: displayName, workspace_name: wsName, workspace_slug: wsSlug }),
+    });
+  }
+
+  getWorkspaces() {
+    return this.request<{ workspaces: unknown[] }>('/api/workspaces');
+  }
+
+  createWorkspace(name: string, slug: string) {
+    return this.request<{ workspace: { id: string }; access_token: string; refresh_token: string }>(
+      '/api/workspaces',
+      { method: 'POST', body: JSON.stringify({ name, slug }) },
+    );
+  }
+
+  getMembers(workspaceId: string) {
+    return this.request<{ members: unknown[] }>(`/api/workspaces/${workspaceId}/members`);
+  }
+
+  inviteMember(workspaceId: string, email: string, role: string) {
+    return this.request(`/api/workspaces/${workspaceId}/members`, {
+      method: 'POST',
+      body: JSON.stringify({ email, role }),
+    });
+  }
+
+  removeMember(workspaceId: string, userId: string): Promise<void> {
+    return this.request(`/api/workspaces/${workspaceId}/members/${userId}`, { method: 'DELETE' });
+  }
+
+  // ─── Articles (updated) ───
+  updateArticle(workspaceId: string, id: string, data: { title?: string; content?: string; status?: string }) {
+    return this.request<{ article: unknown }>(`/api/workspaces/${workspaceId}/articles/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    });
+  }
+```
+
+---
+
+## 3. `src/client/index.html`
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>XLean</title>
+  </head>
+  <body class="bg-surface">
+    <div id="root"></div>
+    <script type="module" src="/main.tsx"></script>
+  </body>
+</html>
+```
+
+---
+
+## 4. Integration Test Seed Data
+
+```typescript
+// tests/helpers/seed.ts
+import { db } from '../../src/data/db';
+import crypto from 'node:crypto';
+
+export interface SeedData {
+  userA: string;
+  userB: string;
+  workspaceA: string;
+  workspaceB: string;
+}
+
+export async function seed(): Promise<SeedData> {
+  const userA = crypto.randomUUID();
+  const userB = crypto.randomUUID();
+  const workspaceA = crypto.randomUUID();
+  const workspaceB = crypto.randomUUID();
+
+  // Seed as app_migrate (bypasses RLS)
+  await db.transaction(async (trx) => {
+    await trx.raw("SELECT set_config('app.workspace_id', '', true)");
+    await trx('users').insert([
+      { id: userA, email: 'seed-a@test.com', password_hash: 'x', display_name: 'Seed A' },
+      { id: userB, email: 'seed-b@test.com', password_hash: 'x', display_name: 'Seed B' },
+    ]);
+    await trx('workspaces').insert([
+      { id: workspaceA, name: 'Workspace A', slug: 'seed-a' },
+      { id: workspaceB, name: 'Workspace B', slug: 'seed-b' },
+    ]);
+    await trx('workspace_members').insert([
+      { id: crypto.randomUUID(), workspace_id: workspaceA, user_id: userA, role: 'owner' },
+      { id: crypto.randomUUID(), workspace_id: workspaceB, user_id: userB, role: 'owner' },
+    ]);
+  });
+
+  return { userA, userB, workspaceA, workspaceB };
+}
+
+export async function clean(): Promise<void> {
+  await db.transaction(async (trx) => {
+    await trx.raw("SELECT set_config('app.workspace_id', '', true)");
+    await trx('audit_logs').del();
+    await trx('articles').del();
+    await trx('workspace_members').del();
+    await trx('workspaces').del();
+    await trx('users').del();
+  });
+}
+```
+
+---
+
+## 5. Phase 3 Test Additions
+
+```typescript
+// tests/api/handlers/workspaces.test.ts
+import { describe, it, expect, beforeEach, afterAll } from 'bun:test';
+import { createServer } from 'http';
+import type { AddressInfo } from 'net';
+import express from 'express';
+import jwt from 'jsonwebtoken';
+import { db } from '../../../src/data/db';
+import { redis } from '../../../src/data/redis';
+import { config } from '../../../src/pkg/config';
+import workspacesRouter from '../../../src/api/handlers/workspaces';
+import { errorHandler } from '../../../src/api/middleware/error-handler';
+import { authenticate } from '../../../src/api/middleware/auth';
+
+let server: ReturnType<typeof createServer>;
+let baseUrl: string;
+let token: string;
+let workspaceId: string;
+let userId: string;
+
+beforeEach(async () => {
+  await db('workspace_members').del();
+  await db('workspaces').del();
+  await db('users').del();
+  await redis.flushdb();
+
+  // Seed
+  userId = crypto.randomUUID();
+  workspaceId = crypto.randomUUID();
+  await db('users').insert({ id: userId, email: 'ws@test.com', password_hash: 'x', display_name: 'WS' });
+  await db('workspaces').insert({ id: workspaceId, name: 'Test', slug: 'test' });
+  await db('workspace_members').insert({
+    id: crypto.randomUUID(), workspace_id: workspaceId, user_id: userId, role: 'owner',
+  });
+  await redis.set(`session:${userId}:${workspaceId}`,
+    JSON.stringify({ token_hash: 'x', created_at: Date.now() }), 'EX', 3600);
+
+  token = jwt.sign({ sub: userId, workspace_id: workspaceId, role: 'owner' }, config.jwt.secret, { expiresIn: '15m' });
+
+  const app = express();
+  app.use(express.json());
+  app.use('/api/workspaces', authenticate, workspacesRouter);
+  app.use(errorHandler);
+
+  await new Promise<void>((r) => { server = createServer(app); server.listen(0, r); });
+  baseUrl = `http://localhost:${(server.address() as AddressInfo).port}`;
+});
+
+afterAll(async () => {
+  await new Promise<void>((r) => server.close(() => r()));
+  await db.destroy();
+  redis.disconnect();
+});
+
+const auth = { Authorization: `Bearer ${token}` };
+
+describe('GET /api/workspaces', () => {
+  it('returns the user\'s workspaces', async () => {
+    const res = await fetch(`${baseUrl}/api/workspaces`, { headers: auth });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.workspaces).toHaveLength(1);
+    expect(body.workspaces[0].slug).toBe('test');
+    expect(body.workspaces[0].role).toBe('owner');
+  });
+});
+
+describe('POST /api/workspaces', () => {
+  it('creates a new workspace with owner membership', async () => {
+    const res = await fetch(`${baseUrl}/api/workspaces`, {
+      method: 'POST',
+      headers: { ...auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'New WS', slug: 'new-ws' }),
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.workspace.slug).toBe('new-ws');
+    expect(body.access_token).toBeDefined();
+  });
+
+  it('rejects duplicate slug', async () => {
+    const res = await fetch(`${baseUrl}/api/workspaces`, {
+      method: 'POST',
+      headers: { ...auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Dup', slug: 'test' }),
+    });
+    expect(res.status).toBe(409);
+  });
+});
+
+describe('POST /api/workspaces/:id/members (invite)', () => {
+  it('invites a new member', async () => {
+    // Create a second user
+    const userId2 = crypto.randomUUID();
+    await db('users').insert({ id: userId2, email: 'invite@test.com', password_hash: 'x', display_name: 'Invited' });
+
+    const res = await fetch(`${baseUrl}/api/workspaces/${workspaceId}/members`, {
+      method: 'POST',
+      headers: { ...auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'invite@test.com', role: 'member' }),
+    });
+    expect(res.status).toBe(201);
+  });
+
+  it('rejects unknown email', async () => {
+    const res = await fetch(`${baseUrl}/api/workspaces/${workspaceId}/members`, {
+      method: 'POST',
+      headers: { ...auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'nobody@test.com', role: 'member' }),
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe('DELETE /api/workspaces/:id/members/:userId', () => {
+  it('removes a member and revokes their session', async () => {
+    const userId2 = crypto.randomUUID();
+    await db('users').insert({ id: userId2, email: 'remove@test.com', password_hash: 'x', display_name: 'Remove' });
+    await db('workspace_members').insert({
+      id: crypto.randomUUID(), workspace_id: workspaceId, user_id: userId2, role: 'member',
+    });
+    await redis.set(`session:${userId2}:${workspaceId}`, 'x', 'EX', 3600);
+
+    const res = await fetch(`${baseUrl}/api/workspaces/${workspaceId}/members/${userId2}`, {
+      method: 'DELETE',
+      headers: auth,
+    });
+    expect(res.status).toBe(204);
+
+    // Session should be revoked
+    const exists = await redis.exists(`session:${userId2}:${workspaceId}`);
+    expect(exists).toBe(0);
+  });
+});
+
+describe('DELETE /api/workspaces/:id (delete workspace)', () => {
+  it('deletes the workspace and cascades', async () => {
+    const res = await fetch(`${baseUrl}/api/workspaces/${workspaceId}`, {
+      method: 'DELETE',
+      headers: auth,
+    });
+    expect(res.status).toBe(204);
+
+    const ws = await db('workspaces').where({ id: workspaceId }).first();
+    expect(ws).toBeUndefined();
+  });
+});
+```
+
+---
+
+## 6. Updated CI (Phase 3 Additions)
+
+Add to the `test` job in `.github/workflows/ci.yml`:
+
+```yaml
+      - name: Python audit (Phase 3)
+        run: python3 scripts/audit_repo.py
+        continue-on-error: false
+```
+
+The existing `check` and `test` jobs already cover the new workspace handler (it's in `src/api/handlers/`, which is linted and tested). No structural CI changes needed beyond confirming the new test file is picked up by `bun test` (it is — `bun test` discovers all `*.test.ts` files recursively).
+
+---
+
+## 7. `package.json` Script Additions (Phase 3)
+
+```json
+{
+  "scripts": {
+    "dev:client": "cd src/client && bunx vite",
+    "build:client": "cd src/client && bunx vite build",
+    "dev:all": "bun run dev & bun run dev:client"
+  }
+}
+```
+
+---
+
+## Phase 3 Exit Criteria
+
+| Check | Command | Expected |
+|-------|---------|----------|
+| Type safety | `bun check --no-script` | 0 errors |
+| All tests pass | `bun test` | Green (includes new `workspaces.test.ts`) |
+| Coverage gate | `bun scripts/check-coverage.ts` | ≥ 90% line + function (aggregate) |
+| Python audit | `python3 scripts/audit_repo.py` | 0 errors |
+| Client builds | `bun run build:client` | `src/client/dist/` produced |
+| SPA serves in prod | `bun dev` → `http://localhost:3000` | Login page renders |
+| Workspace CRUD works | Manual: register → create WS → invite → list articles | 201/200/204 responses |
+| RLS still enforced | `bun test tests/data/tenant-dal.test.ts` | All 11 tests green |
+
+**Phase 3 is complete when all 8 checks pass and CI is green on push to `main`.**
+
+
+
 🏛️ XLean Repo Fortress (Omega Edition): Phase 2 Component Integration & Verification Summary
 The provided Phase 2 code artifacts—encompassing the Golden Repository configuration generator (generate_config.py), the authentication control plane (src/api/handlers/auth.ts), and the isolated test suites (auth.test.ts, tenant-dal.test.ts)—have been mapped into the system architecture and verified against the XLean security and performance invariants.
 1. Component Verification Matrix
