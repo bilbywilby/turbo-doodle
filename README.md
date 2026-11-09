@@ -1,3 +1,1377 @@
+Here's the remaining implementation detail — the full auth handler, exact test files, automated Termux setup, the Python audit script, and a Day-1 onboarding runbook.
+
+---
+
+## `src/api/handlers/auth.ts` (Full Implementation)
+
+```typescript
+// src/api/handlers/auth.ts
+// //HIGH-RISK: Authentication gate. Token issuance, verification, and revocation.
+import { Router, Request, Response, NextFunction } from 'express';
+import { z } from 'zod';
+import crypto from 'node:crypto';
+import jwt from 'jsonwebtoken';
+import { db } from '../../data/db';
+import { redis } from '../../data/redis';
+import { config } from '../../pkg/config';
+import { logger } from '../../pkg/logger';
+import { BadRequestError, UnauthorizedError, ConflictError } from '../../pkg/errors';
+
+const router = Router();
+
+// ─── Schemas ───
+
+const loginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8).max(256),
+});
+
+const registerSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8).max(256),
+  display_name: z.string().min(1).max(100),
+  workspace_name: z.string().min(1).max(255),
+  workspace_slug: z.string().min(2).max(100).regex(/^[a-z0-9-]+$/),
+});
+
+const refreshSchema = z.object({
+  refresh_token: z.string().min(32),
+});
+
+// ─── Helpers ───
+
+async function hashPassword(password: string): Promise<string> {
+  return crypto.argon2.hash(password, {
+    variant: 'argon2id',
+    memoryCost: config.argon2.memoryCost,
+    timeCost: config.argon2.timeCost,
+    parallelism: config.argon2.parallelism,
+  });
+}
+
+async function verifyPassword(hash: string, password: string): Promise<boolean> {
+  return crypto.argon2.verify(hash, password);
+}
+
+function issueAccessToken(userId: string, workspaceId: string, role: string): string {
+  return jwt.sign(
+    { sub: userId, workspace_id: workspaceId, role },
+    config.jwt.secret,
+    { expiresIn: config.jwt.expiry, issuer: 'xlean' },
+  );
+}
+
+function generateRefreshToken(): string {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+async function storeRefreshToken(
+  userId: string,
+  workspaceId: string,
+  refreshToken: string,
+): Promise<void> {
+  const key = `session:${userId}:${workspaceId}`;
+  const ttlSeconds = config.refreshTokenTtlDays * 86400;
+  await redis.set(
+    key,
+    JSON.stringify({
+      token_hash: crypto.createHash('sha256').update(refreshToken).digest('hex'),
+      created_at: Date.now(),
+    }),
+    'EX',
+    ttlSeconds,
+  );
+}
+
+async function deleteSession(userId: string, workspaceId: string): Promise<void> {
+  await redis.del(`session:${userId}:${workspaceId}`);
+}
+
+// ─── POST /api/auth/register ───
+
+router.post('/register', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const data = registerSchema.parse(req.body);
+
+    // Check if email exists
+    const existing = await db('users').where({ email: data.email }).first();
+    if (existing) {
+      throw new ConflictError('Email already registered');
+    }
+
+    // Check if workspace slug exists
+    const existingWs = await db('workspaces').where({ slug: data.workspace_slug }).first();
+    if (existingWs) {
+      throw new ConflictError('Workspace slug already taken');
+    }
+
+    const passwordHash = await hashPassword(data.password);
+
+    // Create user + workspace + membership atomically
+    const userId = crypto.randomUUID();
+    const workspaceId = crypto.randomUUID();
+
+    await db.transaction(async (trx) => {
+      await trx('users').insert({
+        id: userId,
+        email: data.email,
+        password_hash: passwordHash,
+        display_name: data.display_name,
+      });
+      await trx('workspaces').insert({
+        id: workspaceId,
+        name: data.workspace_name,
+        slug: data.workspace_slug,
+      });
+      await trx('workspace_members').insert({
+        id: crypto.randomUUID(),
+        workspace_id: workspaceId,
+        user_id: userId,
+        role: 'owner',
+      });
+    });
+
+    // Issue tokens
+    const accessToken = issueAccessToken(userId, workspaceId, 'owner');
+    const refreshToken = generateRefreshToken();
+    await storeRefreshToken(userId, workspaceId, refreshToken);
+
+    res.status(201).json({
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      expires_in: 900,
+      workspace: { id: workspaceId, slug: data.workspace_slug },
+    });
+  } catch (err) {
+    if (err instanceof z.ZodError) {
+      next(new BadRequestError('Validation failed', { errors: err.flatten() }));
+    } else {
+      next(err);
+    }
+  }
+});
+
+// ─── POST /api/auth/login ───
+
+router.post('/login', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { email, password } = loginSchema.parse(req.body);
+
+    // Look up user
+    const user = await db('users').where({ email }).first();
+    if (!user) {
+      throw new UnauthorizedError('Invalid credentials');
+    }
+
+    // Verify password
+    const valid = await verifyPassword(user.password_hash, password);
+    if (!valid) {
+      throw new UnauthorizedError('Invalid credentials');
+    }
+
+    // Get first workspace membership
+    const membership = await db('workspace_members')
+      .where({ user_id: user.id })
+      .first();
+    if (!membership) {
+      throw new UnauthorizedError('No workspace membership');
+    }
+
+    // Issue tokens
+    const accessToken = issueAccessToken(user.id, membership.workspace_id, membership.role);
+    const refreshToken = generateRefreshToken();
+    await storeRefreshToken(user.id, membership.workspace_id, refreshToken);
+
+    logger.info({ userId: user.id, workspaceId: membership.workspace_id }, 'User logged in');
+
+    res.json({
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      expires_in: 900,
+      workspace: { id: membership.workspace_id },
+    });
+  } catch (err) {
+    if (err instanceof z.ZodError) {
+      next(new BadRequestError('Validation failed', { errors: err.flatten() }));
+    } else {
+      next(err);
+    }
+  }
+});
+
+// ─── POST /api/auth/refresh ───
+
+router.post('/refresh', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { refresh_token } = refreshSchema.parse(req.body);
+    const tokenHash = crypto.createHash('sha256').update(refresh_token).digest('hex');
+
+    // We need the user_id + workspace_id to construct the Redis key.
+    // Since the refresh token is opaque, we store a reverse-lookup:
+    //   refresh_lookup:{token_hash} → { user_id, workspace_id }
+    const lookupKey = `refresh_lookup:${tokenHash}`;
+    const sessionData = await redis.get(lookupKey);
+
+    if (!sessionData) {
+      throw new UnauthorizedError('Invalid or expired refresh token');
+    }
+
+    const { user_id, workspace_id } = JSON.parse(sessionData);
+    const sessionKey = `session:${user_id}:${workspace_id}`;
+    const storedSession = await redis.get(sessionKey);
+
+    if (!storedSession) {
+      // Session was revoked
+      await redis.del(lookupKey);
+      throw new UnauthorizedError('Session revoked');
+    }
+
+    const stored = JSON.parse(storedSession);
+    if (stored.token_hash !== tokenHash) {
+      // Token was already rotated (potential replay)
+      // Invalidate the entire session (security: possible token theft)
+      await redis.del(sessionKey, lookupKey);
+      throw new UnauthorizedError('Token reuse detected');
+    }
+
+    // Get the user's role
+    const membership = await db('workspace_members')
+      .where({ user_id, workspace_id })
+      .first();
+    if (!membership) {
+      await redis.del(sessionKey, lookupKey);
+      throw new UnauthorizedError('Membership revoked');
+    }
+
+    // ROTATE: issue new tokens, delete old
+    const newAccessToken = issueAccessToken(user_id, workspace_id, membership.role);
+    const newRefreshToken = generateRefreshToken();
+    const newTokenHash = crypto.createHash('sha256').update(newRefreshToken).digest('hex');
+
+    const ttlSeconds = config.refreshTokenTtlDays * 86400;
+    await redis.set(
+      sessionKey,
+      JSON.stringify({ token_hash: newTokenHash, created_at: Date.now() }),
+      'EX',
+      ttlSeconds,
+    );
+    await redis.set(
+      `refresh_lookup:${newTokenHash}`,
+      JSON.stringify({ user_id, workspace_id }),
+      'EX',
+      ttlSeconds,
+    );
+    await redis.del(lookupKey);  // Delete old lookup
+
+    res.json({
+      access_token: newAccessToken,
+      refresh_token: newRefreshToken,
+      expires_in: 900,
+    });
+  } catch (err) {
+    if (err instanceof z.ZodError) {
+      next(new BadRequestError('Validation failed', { errors: err.flatten() }));
+    } else {
+      next(err);
+    }
+  }
+});
+
+// ─── POST /api/auth/logout ───
+
+router.post('/logout', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!req.context) {
+      // Not authenticated — nothing to revoke
+      res.status(204).send();
+      return;
+    }
+
+    await deleteSession(req.context.userId, req.context.workspaceId);
+    res.status(204).send();
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── POST /api/auth/change-password ───
+
+router.post('/change-password', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!req.context) throw new UnauthorizedError();
+
+    const schema = z.object({
+      current_password: z.string().min(8),
+      new_password: z.string().min(8).max(256),
+    });
+    const { current_password, new_password } = schema.parse(req.body);
+
+    const user = await db('users').where({ id: req.context.userId }).first();
+    if (!user) throw new UnauthorizedError();
+
+    const valid = await verifyPassword(user.password_hash, current_password);
+    if (!valid) throw new UnauthorizedError('Current password incorrect');
+
+    const newHash = await hashPassword(new_password);
+    await db('users').where({ id: user.id }).update({ password_hash: newHash });
+
+    // Revoke ALL sessions for this user (all workspaces)
+    const memberships = await db('workspace_members').where({ user_id: user.id });
+    for (const m of memberships) {
+      await deleteSession(user.id, m.workspace_id);
+    }
+
+    logger.info({ userId: user.id }, 'Password changed, all sessions revoked');
+    res.status(204).send();
+  } catch (err) {
+    if (err instanceof z.ZodError) {
+      next(new BadRequestError('Validation failed', { errors: err.flatten() }));
+    } else {
+      next(err);
+    }
+  }
+});
+
+export default router;
+```
+
+> **The `refresh_lookup` Redis key** is the mechanism that lets the refresh endpoint find the session without trusting the client to provide `user_id` + `workspace_id`. It's a one-way mapping: `sha256(refresh_token)` → `{ user_id, workspace_id }`. The token itself is never stored in Redis (only its hash).
+
+---
+
+## The Full Test Files (Exact)
+
+### `tests/api/handlers/auth.test.ts`
+
+```typescript
+// tests/api/handlers/auth.test.ts
+import { describe, it, expect, beforeEach, afterAll } from 'bun:test';
+import { createServer } from 'http';
+import type { AddressInfo } from 'net';
+import express from 'express';
+import { db } from '../../../src/data/db';
+import { redis } from '../../../src/data/redis';
+import authRouter from '../../../src/api/handlers/auth';
+import { errorHandler } from '../../../src/api/middleware/error-handler';
+
+let server: ReturnType<typeof createServer>;
+let baseUrl: string;
+
+beforeEach(async () => {
+  // Clean state
+  await db('workspace_members').del();
+  await db('workspaces').del();
+  await db('users').del();
+  await redis.flushdb();
+
+  const app = express();
+  app.use(express.json());
+  app.use('/api/auth', authRouter);
+  app.use(errorHandler);
+
+  await new Promise<void>((resolve) => {
+    server = createServer(app);
+    server.listen(0, () => resolve());
+  });
+  baseUrl = `http://localhost:${(server.address() as AddressInfo).port}`;
+});
+
+afterAll(async () => {
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  await db.destroy();
+  redis.disconnect();
+});
+
+describe('POST /api/auth/register', () => {
+  it('creates user, workspace, and issues tokens', async () => {
+    const res = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'test@example.com',
+        password: 'securepassword123',
+        display_name: 'Test User',
+        workspace_name: 'Test WS',
+        workspace_slug: 'test-ws',
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.access_token).toBeDefined();
+    expect(body.refresh_token).toBeDefined();
+    expect(body.expires_in).toBe(900);
+    expect(body.workspace.slug).toBe('test-ws');
+  });
+
+  it('rejects duplicate email', async () => {
+    const payload = {
+      email: 'dup@example.com',
+      password: 'securepassword123',
+      display_name: 'Dup',
+      workspace_name: 'WS',
+      workspace_slug: 'dup-ws',
+    };
+    await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    const res = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    expect(res.status).toBe(409);
+  });
+
+  it('rejects invalid email', async () => {
+    const res = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'not-an-email',
+        password: 'securepassword123',
+        display_name: 'X',
+        workspace_name: 'WS',
+        workspace_slug: 'x-ws',
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects short password', async () => {
+    const res = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'short@example.com',
+        password: 'short',
+        display_name: 'X',
+        workspace_name: 'WS',
+        workspace_slug: 'short-ws',
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
+describe('POST /api/auth/login', () => {
+  beforeEach(async () => {
+    // Seed a user
+    const userId = crypto.randomUUID();
+    const wsId = crypto.randomUUID();
+    await db('users').insert({
+      id: userId,
+      email: 'login@example.com',
+      password_hash: await Bun.password.hash('mypassword123', {
+        variant: 'argon2id',
+        memoryCost: 19456,
+        timeCost: 2,
+        parallelism: 1,
+      }),
+      display_name: 'Login User',
+    });
+    await db('workspaces').insert({ id: wsId, name: 'WS', slug: 'login-ws' });
+    await db('workspace_members').insert({
+      id: crypto.randomUUID(),
+      workspace_id: wsId,
+      user_id: userId,
+      role: 'owner',
+    });
+  });
+
+  it('returns tokens for valid credentials', async () => {
+    const res = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'login@example.com', password: 'mypassword123' }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.access_token).toBeDefined();
+    expect(body.refresh_token).toBeDefined();
+  });
+
+  it('rejects wrong password', async () => {
+    const res = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'login@example.com', password: 'wrongpassword' }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects unknown email', async () => {
+    const res = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'unknown@example.com', password: 'whatever123' }),
+    });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe('POST /api/auth/refresh', () => {
+  it('rotates tokens on valid refresh', async () => {
+    // Register first
+    const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'refresh@example.com',
+        password: 'securepassword123',
+        display_name: 'R',
+        workspace_name: 'WS',
+        workspace_slug: 'refresh-ws',
+      }),
+    });
+    const { refresh_token } = await regRes.json();
+
+    // Refresh
+    const res = await fetch(`${baseUrl}/api/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.access_token).toBeDefined();
+    expect(body.refresh_token).toBeDefined();
+    expect(body.refresh_token).not.toBe(refresh_token);  // Rotated
+  });
+
+  it('rejects reused (rotated) token', async () => {
+    const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'reuse@example.com',
+        password: 'securepassword123',
+        display_name: 'R',
+        workspace_name: 'WS',
+        workspace_slug: 'reuse-ws',
+      }),
+    });
+    const { refresh_token } = await regRes.json();
+
+    // First refresh (succeeds)
+    await fetch(`${baseUrl}/api/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token }),
+    });
+
+    // Second refresh with SAME token (replay attack)
+    const res = await fetch(`${baseUrl}/api/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token }),
+    });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe('POST /api/auth/logout', () => {
+  it('revokes the session', async () => {
+    // Register
+    const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'logout@example.com',
+        password: 'securepassword123',
+        display_name: 'L',
+        workspace_name: 'WS',
+        workspace_slug: 'logout-ws',
+      }),
+    });
+    const { access_token, refresh_token } = await regRes.json();
+
+    // Logout
+    const res = await fetch(`${baseUrl}/api/auth/logout`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${access_token}` },
+    });
+    expect(res.status).toBe(204);
+
+    // Refresh should now fail (session deleted)
+    const refreshRes = await fetch(`${baseUrl}/api/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token }),
+    });
+    expect(refreshRes.status).toBe(401);
+  });
+});
+```
+
+### `tests/data/tenant-dal.test.ts` (Full)
+
+```typescript
+// tests/data/tenant-dal.test.ts
+import { describe, it, expect, beforeEach, afterAll } from 'bun:test';
+import { TenantDAL } from '../../src/data/tenant-dal';
+import { db } from '../../src/data/db';
+
+let workspaceA: string;
+let workspaceB: string;
+let userA: string;
+let userB: string;
+
+beforeEach(async () => {
+  // Run as app_migrate (bypass RLS) to seed data
+  await db.transaction(async (trx) => {
+    await trx.raw("SELECT set_config('app.workspace_id', '', true)");
+    await trx('articles').del();
+    await trx('audit_logs').del();
+    await trx('workspace_members').del();
+    await trx('workspaces').del();
+    await trx('users').del();
+  });
+
+  userA = crypto.randomUUID();
+  userB = crypto.randomUUID();
+  workspaceA = crypto.randomUUID();
+  workspaceB = crypto.randomUUID();
+
+  await db.transaction(async (trx) => {
+    await trx.raw("SELECT set_config('app.workspace_id', '', true)");
+    await trx('users').insert([
+      { id: userA, email: 'a@test.com', password_hash: 'x', display_name: 'A' },
+      { id: userB, email: 'b@test.com', password_hash: 'x', display_name: 'B' },
+    ]);
+    await trx('workspaces').insert([
+      { id: workspaceA, name: 'Tenant A', slug: 'tenant-a' },
+      { id: workspaceB, name: 'Tenant B', slug: 'tenant-b' },
+    ]);
+    await trx('workspace_members').insert([
+      { id: crypto.randomUUID(), workspace_id: workspaceA, user_id: userA, role: 'owner' },
+      { id: crypto.randomUUID(), workspace_id: workspaceB, user_id: userB, role: 'owner' },
+    ]);
+  });
+});
+
+afterAll(async () => {
+  await db.destroy();
+});
+
+describe('TenantDAL — Isolation (100% branch target)', () => {
+  it('SELECT: tenant A cannot see tenant B articles', async () => {
+    const dalB = new TenantDAL(workspaceB);
+    await dalB.createArticle({ title: 'B secret', content: 'x', status: 'published', author_id: userB });
+
+    const dalA = new TenantDAL(workspaceA);
+    const articles = await dalA.getArticles();
+    expect(articles).toHaveLength(0);
+  });
+
+  it('SELECT by ID: cross-tenant returns null', async () => {
+    const dalB = new TenantDAL(workspaceB);
+    const article = await dalB.createArticle({ title: 'B doc', content: 'x', status: 'published', author_id: userB });
+
+    const dalA = new TenantDAL(workspaceA);
+    const result = await dalA.getArticle(article.id);
+    expect(result).toBeNull();
+  });
+
+  it('SELECT with status filter: only returns matching status for own tenant', async () => {
+    const dalA = new TenantDAL(workspaceA);
+    await dalA.createArticle({ title: 'Draft', content: 'x', status: 'draft', author_id: userA });
+    await dalA.createArticle({ title: 'Pub', content: 'x', status: 'published', author_id: userA });
+
+    const published = await dalA.getArticles('published');
+    expect(published).toHaveLength(1);
+    expect(published[0].title).toBe('Pub');
+  });
+
+  it('INSERT: row is stamped with correct workspace_id', async () => {
+    const dalA = new TenantDAL(workspaceA);
+    const article = await dalA.createArticle({ title: 'A doc', content: 'x', status: 'draft', author_id: userA });
+    expect(article.workspace_id).toBe(workspaceA);
+  });
+
+  it('UPDATE: cannot modify another tenant row (returns null)', async () => {
+    const dalB = new TenantDAL(workspaceB);
+    const article = await dalB.createArticle({ title: 'B doc', content: 'original', status: 'published', author_id: userB });
+
+    const dalA = new TenantDAL(workspaceA);
+    const updated = await dalA.updateArticle(article.id, { content: 'hacked' });
+    expect(updated).toBeNull();
+  });
+
+  it('UPDATE: can modify own tenant row', async () => {
+    const dalA = new TenantDAL(workspaceA);
+    const article = await dalA.createArticle({ title: 'A doc', content: 'v1', status: 'draft', author_id: userA });
+
+    const updated = await dalA.updateArticle(article.id, { content: 'v2' });
+    expect(updated).not.toBeNull();
+    expect(updated!.content).toBe('v2');
+  });
+
+  it('DELETE: cannot delete another tenant row (returns false)', async () => {
+    const dalB = new TenantDAL(workspaceB);
+    const article = await dalB.createArticle({ title: 'B doc', content: 'x', status: 'published', author_id: userB });
+
+    const dalA = new TenantDAL(workspaceA);
+    const deleted = await dalA.deleteArticle(article.id);
+    expect(deleted).toBe(false);
+  });
+
+  it('DELETE: can delete own tenant row', async () => {
+    const dalA = new TenantDAL(workspaceA);
+    const article = await dalA.createArticle({ title: 'A doc', content: 'x', status: 'draft', author_id: userA });
+
+    const deleted = await dalA.deleteArticle(article.id);
+    expect(deleted).toBe(true);
+  });
+
+  it('SET LOCAL resets on transaction end (no pool leak)', async () => {
+    const dalA = new TenantDAL(workspaceA);
+    const dalB = new TenantDAL(workspaceB);
+
+    await dalB.createArticle({ title: 'B doc', content: 'x', status: 'published', author_id: userB });
+
+    // Run as A (uses a pooled connection)
+    const aArticles = await dalA.getArticles();
+    expect(aArticles).toHaveLength(0);
+
+    // Run as B on the (potentially same) pooled connection
+    const bArticles = await dalB.getArticles();
+    expect(bArticles).toHaveLength(1);
+  });
+
+  it('GUC unset → zero rows (fail closed)', async () => {
+    // Direct query without SET LOCAL
+    const rows = await db('articles');
+    expect(rows).toHaveLength(0);
+  });
+
+  it('audit() writes to audit_logs scoped to workspace', async () => {
+    const dalA = new TenantDAL(workspaceA);
+    await dalA.audit({
+      action: 'article.create',
+      resource_type: 'article',
+      resource_id: crypto.randomUUID(),
+      actor_id: userA,
+      metadata: { title: 'test' },
+    });
+
+    const dalB = new TenantDAL(workspaceB);
+    // B cannot see A's audit logs
+    const bLogs = await db.transaction(async (trx) => {
+      await trx.raw('SELECT set_config(\'app.workspace_id\', ?, true)', [workspaceB]);
+      return trx('audit_logs');
+    });
+    expect(bLogs).toHaveLength(0);
+  });
+});
+```
+
+---
+
+## The Automated Termux Setup Script
+
+```bash
+#!/usr/bin/env bash
+# scripts/setup-termux.sh
+# Run on the Pixel 10a (Android 17, aarch64) to bootstrap the dev environment.
+# Requires: Termux + proot-distro already installed.
+
+set -euo pipefail
+
+echo "═══ XLean Termux Setup ═══"
+
+# 1. Install Ubuntu via proot-distro if not present
+if ! proot-distro list --installed 2>/dev/null | grep -q ubuntu; then
+  echo "▶ Installing Ubuntu via proot-distro..."
+  proot-distro install ubuntu
+fi
+
+# 2. Login to Ubuntu and run setup
+proot-distro login ubuntu -- bash <<'EOF'
+set -euo pipefail
+
+echo "▶ Installing system packages..."
+sudo apt update
+sudo apt install -y postgresql-15 redis-server git curl ca-certificates build-essential
+
+echo "▶ Starting services..."
+sudo systemctl start postgresql
+sudo systemctl start redis-server
+
+echo "▶ Creating database roles..."
+sudo -u postgres psql <<'SQL'
+  DO $$ BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_tenant') THEN
+      CREATE ROLE app_tenant LOGIN PASSWORD 'dev_password';
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_migrate') THEN
+      CREATE ROLE app_migrate SUPERUSER LOGIN PASSWORD 'migrate_password';
+    END IF;
+  END $$;
+  SELECT 'CREATE DATABASE xlean OWNER app_migrate'
+    WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'xlean')\gexec
+  GRANT ALL ON DATABASE xlean TO app_tenant;
+SQL
+
+echo "▶ Installing Bun..."
+if ! command -v bun &>/dev/null; then
+  curl -fsSL https://bun.sh/install | bash
+fi
+source ~/.bashrc
+
+echo "✓ Setup complete."
+echo ""
+echo "Next steps:"
+echo "  cd ~/xlean"
+echo "  bun install"
+echo "  cp .env.example .env"
+echo "  bunx knex migrate:latest --knexfile knexfile.ts"
+echo "  bun dev"
+EOF
+
+echo "═══ Done ═══"
+```
+
+---
+
+## `scripts/audit_repo.py` (Python Auxiliary Audit)
+
+```python
+#!/usr/bin/env python3
+"""
+XLean Repository Audit Script
+Run: python3 scripts/audit_repo.py
+
+Checks:
+  1. No hardcoded secrets in source
+  2. All //HIGH-RISK files are in CODEOWNERS
+  3. No raw knex queries bypass TenantDAL in handlers
+  4. Migrations are sequential (no gaps in timestamp)
+  5. .env is not committed (in .gitignore)
+  6. No console.log in production paths (use logger)
+"""
+
+import re
+import os
+import sys
+from pathlib import Path
+from datetime import datetime
+
+SRC = Path("src")
+SCRIPTS = Path("scripts")
+MIGRATIONS = SRC / "data" / "migrations"
+CODEOWNERS = Path(".github/CODEOWNERS")
+GITIGNORE = Path(".gitignore")
+
+errors = []
+warnings = []
+
+# ─── 1. Hardcoded Secrets ───
+SECRET_PATTERNS = [
+    (r'(?i)(password|passwd|pwd)\s*[:=]\s*["\'][^"\']{8,}["\']', "Hardcoded password"),
+    (r'(?i)(api[_-]?key|secret|token)\s*[:=]\s*["\'][a-zA-Z0-9+/=_\-]{20,}["\']', "Hardcoded secret/key"),
+    (r'BEGIN (RSA|EC|OPENSSH) PRIVATE KEY', "Private key in source"),
+    (r'(?i)aws_access_key_id\s*[:=]\s*["\']AKIA', "AWS key"),
+]
+
+def check_secrets():
+    print("▶ Checking for hardcoded secrets...")
+    for f in SRC.rglob("*.ts"):
+        content = f.read_text()
+        for i, line in enumerate(content.splitlines(), 1):
+            for pattern, label in SECRET_PATTERNS:
+                if re.search(pattern, line):
+                    # Skip .env.example and test files
+                    if "example" in str(f) or ".test." in str(f):
+                        continue
+                    errors.append(f"{f}:{i}: {label}: {line.strip()[:80]}")
+    if not errors:
+        print("  ✓ No hardcoded secrets found")
+
+# ─── 2. HIGH-RISK in CODEOWNERS ───
+def check_high_risk_coverage():
+    print("▶ Checking //HIGH-RISK files are in CODEOWNERS...")
+    if not CODEOWNERS.exists():
+        errors.append("Missing .github/CODEOWNERS")
+        return
+
+    codeowners_content = CODEOWNERS.read_text()
+    risky_files = []
+    for f in SRC.rglob("*.ts"):
+        if "//HIGH-RISK" in f.read_text():
+            risky_files.append(str(f))
+
+    for rf in risky_files:
+        # Check if the file path or its directory is in CODEOWNERS
+        if rf not in codeowners_content and str(rf.parent) not in codeowners_content:
+            warnings.append(f"//HIGH-RISK file not in CODEOWNERS: {rf}")
+
+    if not warnings:
+        print(f"  ✓ All {len(risky_files)} //HIGH-RISK files covered by CODEOWNERS")
+
+# ─── 3. Raw knex in handlers ───
+def check_no_raw_knex_in_handlers():
+    print("▶ Checking for raw knex in handlers...")
+    handlers_dir = SRC / "api" / "handlers"
+    for f in handlers_dir.glob("*.ts"):
+        content = f.read_text()
+        # Look for direct db( usage (not through req.dal)
+        if re.search(r'\b(db|knex)\s*\(', content) and 'req.dal' in content:
+            # Has both raw db() and req.dal — suspicious
+            for i, line in enumerate(content.splitlines(), 1):
+                if re.search(r'\b(db|knex)\s*\(', line) and 'import' not in line:
+                    warnings.append(f"{f}:{i}: Possible raw knex in handler (should use req.dal)")
+
+    if not warnings:
+        print("  ✓ No raw knex queries in handlers")
+
+# ─── 4. Migration sequence ───
+def check_migrations():
+    print("▶ Checking migration sequence...")
+    if not MIGRATIONS.exists():
+        return
+
+    migrations = sorted(MIGRATIONS.glob("*.ts"))
+    timestamps = []
+    for m in migrations:
+        match = re.match(r'(\d{14})_', m.name)
+        if match:
+            timestamps.append(int(match.group(1)))
+
+    for i in range(1, len(timestamps)):
+        gap = timestamps[i] - timestamps[i-1]
+        if gap > 86400000000:  # More than ~1 day gap (in ms-like units)
+            warnings.append(f"Large gap between migrations: {timestamps[i-1]} → {timestamps[i]}")
+
+    print(f"  ✓ {len(migrations)} migrations, sequence OK")
+
+# ─── 5. .env in .gitignore ───
+def check_gitignore():
+    print("▶ Checking .gitignore...")
+    if not GITIGNORE.exists():
+        errors.append("Missing .gitignore")
+        return
+
+    content = GITIGNORE.read_text()
+    if ".env" not in content and ".env.*" not in content:
+        errors.append(".env not in .gitignore")
+    else:
+        print("  ✓ .env is gitignored")
+
+# ─── 6. console.log in production paths ───
+def check_no_console_log():
+    print("▶ Checking for console.log in src/...")
+    count = 0
+    for f in SRC.rglob("*.ts"):
+        if ".test." in str(f):
+            continue
+        content = f.read_text()
+        for i, line in enumerate(content.splitlines(), 1):
+            if re.search(r'console\.(log|warn|error)\(', line):
+                if "data/redis.ts" in str(f):  # Allowed for connection logging
+                    continue
+                count += 1
+                warnings.append(f"{f}:{i}: console.log (use logger instead)")
+
+    if count == 0:
+        print("  ✓ No console.log in production paths")
+    else:
+        print(f"  ⚠ {count} console.log instances found")
+
+# ─── Run All ───
+if __name__ == "__main__":
+    print("═══ XLean Repository Audit ═══\n")
+    check_secrets()
+    check_high_risk_coverage()
+    check_no_raw_knex_in_handlers()
+    check_migrations()
+    check_gitignore()
+    check_no_console_log()
+
+    print(f"\n{'═' * 40}")
+    if errors:
+        print(f"❌ {len(errors)} ERRORS:")
+        for e in errors:
+            print(f"   {e}")
+        sys.exit(1)
+    if warnings:
+        print(f"⚠ {len(warnings)} WARNINGS:")
+        for w in warnings:
+            print(f"   {w}")
+    print("✓ Audit passed.")
+```
+
+---
+
+## `stryker.config.json` (Mutation Testing)
+
+```json
+{
+  "mutator": "typescript",
+  "testRunner": "bun",
+  "testRunnerNodeArgs": ["--bun"],
+  "mutate": [
+    "src/data/tenant-dal.ts",
+    "src/api/middleware/tenant-context.ts",
+    "src/api/middleware/auth.ts",
+    "src/api/middleware/error-handler.ts",
+    "src/api/middleware/rate-limit.ts"
+  ],
+  "ignoreMutations": [
+    "console.*",
+    "logger.*"
+  ],
+  "thresholds": {
+    "high": 95,
+    "low": 80,
+    "break": 90
+  },
+  "reporters": ["clear-text", "html"],
+  "concurrency": 4,
+  "timeoutMS": 15000,
+  "tempDirName": ".stryker-tmp"
+}
+```
+
+```json
+// package.json addition:
+"mutate": "stryker run",
+"mutate:isolation": "stryker run --mutate 'src/data/tenant-dal.ts src/api/middleware/*.ts'"
+```
+
+> **CI schedule:** Run `mutate:isolation` on a weekly cron (not every PR). It takes ~8-15 minutes for 5 files. Add to `.github/workflows/ci.yml`:
+> ```yaml
+> schedule:
+>   - cron: '0 6 * * 1'  # Monday 6 AM UTC
+> ```
+
+---
+
+## `vite.config.ts` (SPA)
+
+```typescript
+// src/client/vite.config.ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 5173,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:3000',
+        changeOrigin: true,
+      },
+    },
+  },
+  build: {
+    outDir: 'dist',
+    sourcemap: true,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          react: ['react', 'react-dom'],
+        },
+      },
+    },
+  },
+});
+```
+
+---
+
+## `.eslintrc.json` (ESLint 9 Flat Config)
+
+```json
+{
+  "files": ["src/**/*.ts", "tests/**/*.ts"],
+  "ignores": ["dist/**", "node_modules/**", "src/client/dist/**"],
+  "extends": [
+    "eslint:recommended",
+    "plugin:@typescript-eslint/recommended"
+  ],
+  "parserOptions": {
+    "project": "./tsconfig.json"
+  },
+  "rules": {
+    "@typescript-eslint/no-unused-vars": ["error", { "argsIgnorePattern": "^_" }],
+    "@typescript-eslint/no-explicit-any": "error",
+    "no-console": ["warn", { "allow": ["error"] }],
+    "no-process-exit": "off"
+  }
+}
+```
+
+---
+
+## `.prettierrc`
+
+```json
+{
+  "semi": true,
+  "singleQuote": true,
+  "tabWidth": 2,
+  "trailingComma": "all",
+  "printWidth": 100,
+  "arrowParens": "always"
+}
+```
+
+---
+
+## The Day-1 Onboarding Runbook (For New Team Members)
+
+```markdown
+# XLean: Day 1 Setup (30 minutes)
+
+## Prerequisites
+- Bun ≥ 1.4.4 (`bun --version`)
+- PostgreSQL 15 running locally (or Docker)
+- Redis 7 running locally (or Docker)
+- Node.js ≥ 20 (for tooling)
+
+## Step 1: Clone & Install (5 min)
+```bash
+git clone git@github.com:yourorg/xlean.git
+cd xlean
+bun install
+cp .env.example .env
+# Edit .env: set DATABASE_URL, DATABASE_MIGRATE_URL, REDIS_URL, JWT_SECRET
+# Generate JWT_SECRET: openssl rand -hex 32
+```
+
+## Step 2: Start Infrastructure (2 min)
+```bash
+docker-compose up -d
+# Verify:
+pg_isready -h localhost -U app_tenant
+redis-cli ping
+```
+
+## Step 3: Migrate (1 min)
+```bash
+KNEX_ROLE=migrate bunx knex migrate:latest --knexfile knexfile.ts
+# Verify RLS is active:
+psql -U app_tenant -d xlean -c "SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class WHERE relrowsecurity;"
+# All 5 tables should show: t | t
+```
+
+## Step 4: Run Tests (2 min)
+```bash
+bun test
+# Should be all green. If not, check:
+# - Is Postgres running? (pg_isready)
+# - Is Redis running? (redis-cli ping)
+# - Are the env vars set? (cat .env)
+```
+
+## Step 5: Run the App (1 min)
+```bash
+bun dev
+# Open http://localhost:3000/api/health
+# Should return: {"status":"ok","timestamp":"..."}
+```
+
+## Step 6: Run the Audit (1 min)
+```bash
+python3 scripts/audit_repo.py
+# Should pass with no errors
+```
+
+## Step 7: Read the Critical Files (15 min)
+In this order:
+1. `src/data/tenant-dal.ts` — the isolation boundary
+2. `src/data/migrations/20260305000004_enable_rls.ts` — the DB safety net
+3. `src/api/middleware/auth.ts` — the auth gate
+4. `src/api/middleware/tenant-context.ts` — the workspace validator
+5. `tests/data/tenant-dal.test.ts` — how isolation is proven
+
+## Step 8: Make Your First Change
+1. Add a new field to `articles` (e.g., `tags: jsonb`)
+2. Create a new migration
+3. Update `TenantDAL` (add the field to `createArticle` / `updateArticle`)
+4. Add a test to `tests/data/tenant-dal.test.ts`
+5. Run `bun test` → green
+6. Run `bun check` → no type errors
+7. Run `python3 scripts/audit_repo.py` → pass
+8. Open a PR → CI runs → merge
+
+## Rules (Non-Negotiable)
+- NEVER use raw `db()` in handlers. Use `req.dal`.
+- NEVER use `SET` (session-scoped). Always `SET LOCAL`.
+- NEVER remove `//HIGH-RISK` annotations.
+- NEVER grant `BYPASSRLS` or table ownership to `app_tenant`.
+- ALWAYS add a test when adding a source file (1:1 mirror).
+- ALWAYS add RLS + composite index to new tenant tables.
+```
+
+---
+
+## The Complete `.github/workflows/ci.yml` (Final)
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly mutation testing (Monday 6 AM UTC)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUN_VERSION: '1.4.4'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Type check
+        run: bun check
+
+      - name: Lint
+        run: bunx eslint src/ tests/ --ext .ts
+
+      - name: HIGH-RISK gate
+        run: |
+          CHANGED=$(git diff --name-only origin/main...HEAD 2>/dev/null || git diff --name-only HEAD~1)
+          RISKY=$(echo "$CHANGED" | xargs grep -l '//HIGH-RISK' 2>/dev/null || true)
+          if [ -n "$RISKY" ]; then
+            echo "::error::HIGH-RISK files modified without @security-team approval:"
+            echo "$RISKY"
+            exit 1
+          fi
+        if: github.event_name == 'pull_request'
+
+  test:
+    runs-on: ubuntu-latest
+    needs: check
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: xlean_test
+          POSTGRES_USER: app_tenant
+          POSTGRES_PASSWORD: test_password
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+
+      - name: Create roles + migrate
+        run: |
+          sudo -u postgres psql -c "ALTER USER app_tenant PASSWORD 'test_password';"
+          sudo -u postgres psql -c "CREATE ROLE app_migrate SUPERUSER LOGIN PASSWORD 'migrate_password';"
+          sudo -u postgres psql -c "GRANT ALL ON DATABASE xlean_test TO app_tenant;"
+          KNEX_ROLE=migrate bunx knex migrate:latest --knexfile knexfile.ts
+        env:
+          DATABASE_URL: postgres://app_tenant:test_password@localhost:5432/xlean_test
+          DATABASE_MIGRATE_URL: postgres://app_migrate:migrate_password@localhost:5432/xlean_test
+
+      - name: Run tests
+        run: bun test
+        env:
+          DATABASE_URL: postgres://app_tenant:test_password@localhost:5432/xlean_test
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: ci-test-secret-that-is-at-least-64-characters-long-abcdef
+          NODE_ENV: test
+
+      - name: Coverage gate (aggregate)
+        run: bun scripts/check-coverage.ts
+
+      - name: Python audit
+        run: python3 scripts/audit_repo.py
+
+  mutate:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'schedule' || github.ref == 'refs/heads/main'
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: xlean_test
+          POSTGRES_USER: app_tenant
+          POSTGRES_PASSWORD: test_password
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - name: Migrate
+        run: |
+          sudo -u postgres psql -c "ALTER USER app_tenant PASSWORD 'test_password';"
+          sudo -u postgres psql -c "CREATE ROLE IF NOT EXISTS app_migrate SUPERUSER LOGIN PASSWORD 'migrate_password';"
+          sudo -u postgres psql -c "GRANT ALL ON DATABASE xlean_test TO app_tenant;"
+          KNEX_ROLE=migrate bunx knex migrate:latest --knexfile knexfile.ts
+        env:
+          DATABASE_URL: postgres://app_tenant:test_password@localhost:5432/xlean_test
+          DATABASE_MIGRATE_URL: postgres://app_migrate:migrate_password@localhost:5432/xlean_test
+      - name: Mutation test (isolation paths)
+        run: bun mutate:isolation
+        env:
+          DATABASE_URL: postgres://app_tenant:test_password@localhost:5432/xlean_test
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: ci-test-secret-that-is-at-least-64-characters-long-abcdef
+          NODE_ENV: test
+        timeout-minutes: 20
+```
+
+---
+
+## The `CODEOWNERS` File
+
+```
+# .github/CODEOWNERS
+
+# Security-critical: requires @security-team approval
+
+FIX
+
 {
   "handover": {
     "version": "1.0.0",
